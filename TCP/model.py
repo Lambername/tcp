@@ -3,6 +3,8 @@ import numpy as np
 import torch 
 from torch import nn
 from TCP.resnet import *
+import sys
+
 
 
 class PIDController(object):
@@ -28,6 +30,19 @@ class PIDController(object):
 			derivative = 0.0
 
 		return self._K_P * error + self._K_I * integral + self._K_D * derivative
+	
+class CustomTransformerEncoder(nn.Module):
+    def __init__(self, d_model, nhead, num_layers):
+        super(CustomTransformerEncoder, self).__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, src, mask=None, src_key_padding_mask=None):
+        # src: the sequence to the encoder (required).
+        # mask: the mask for the src sequence (optional).
+        # src_key_padding_mask: the mask for the src keys per batch (optional).
+        output = self.transformer_encoder(src, mask=mask, src_key_padding_mask=src_key_padding_mask)
+        return output
 
 class TCP(nn.Module):
 
@@ -66,7 +81,7 @@ class TCP(nn.Module):
 						)
 
 		self.speed_branch = nn.Sequential(
-							nn.Linear(1000, 256),
+							nn.Linear(1000+128, 256),
 							nn.ReLU(inplace=True),
 							nn.Linear(256, 256),
 							nn.Dropout2d(p=0.5),
@@ -133,13 +148,40 @@ class TCP(nn.Module):
 				nn.ReLU(inplace=True),
 				nn.Linear(512, 256),
 			)
-		
+		self.fuse_up = nn.Linear(232, 256)
+		# encoder_layer = nn.TransformerEncoderLayer(d_model=256, nhead=8)
+		# self.trj_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
+		self.trj_encoder = CustomTransformerEncoder(d_model=256, nhead=8, num_layers=6)
+
+		self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+		self.fc_linear = nn.Linear(512, 1000)
+		self.fuse_down = nn.Linear(256, 232)
+		# self.multihead_attn = nn.MultiheadAttention(512, 8)
 
 	def forward(self, img, state, target_point):
-		feature_emb, cnn_feature = self.perception(img)
-		outputs = {}
-		outputs['pred_speed'] = self.speed_branch(feature_emb)
+		batch_size = img.shape[0]
+		#image_shape(16,3,256,900)
+		feature_emb, cnn_feature = self.perception(img)   # cnn_feature(16,512,8,29)
+
+		cnn_feature = cnn_feature.reshape(batch_size, 512, -1)  # (batch_size, 512, 232)
+		cnn_feature = cnn_feature.permute(1, 0, 2)  # 现在形状是 (512, 8, 232)
+		encoder_output = self.fuse_up(cnn_feature)
+
+		# 假设 self.transformer 是你的 Transformer 模型
+		encoder_output = self.trj_encoder(encoder_output)   #(512, 8, 256)
+		encoder_output = encoder_output.permute(1, 0, 2)
+		encoder_output = self.fuse_down(encoder_output)
+		cnn_feature = encoder_output.reshape(batch_size, 512, 8, -1)
+
+		feature_emb = self.avgpool(cnn_feature)
+		feature_emb = torch.flatten(feature_emb, 1)
+		# print("11111", trj_output.shape)
+		feature_emb = self.fc_linear(feature_emb)
+		
 		measurement_feature = self.measurements(state)
+		outputs = {}
+		# outputs['pred_speed'] = self.speed_branch(trj_output)
+		outputs['pred_speed'] = self.speed_branch(torch.cat([feature_emb, measurement_feature], 1))
 		
 		j_traj = self.join_traj(torch.cat([feature_emb, measurement_feature], 1))
 		outputs['pred_value_traj'] = self.value_branch_traj(j_traj)
@@ -153,8 +195,8 @@ class TCP(nn.Module):
 
 		# autoregressive generation of output waypoints
 		for _ in range(self.config.pred_len):
-			x_in = torch.cat([x, target_point], dim=1)
-			z = self.decoder_traj(x_in, z)
+			x_in = torch.cat([x, target_point], dim=1)  # (8, 4)
+			z = self.decoder_traj(x_in, z)   # 轨迹特征当隐状态
 			traj_hidden_state.append(z)
 			dx = self.output_traj(z)
 			x = dx + x
@@ -164,8 +206,12 @@ class TCP(nn.Module):
 		outputs['pred_wp'] = pred_wp
 
 		traj_hidden_state = torch.stack(traj_hidden_state, dim=1)
+
+		att = self.init_att[:-1](measurement_feature).view(-1, 1, 8, 29)
 		init_att = self.init_att(measurement_feature).view(-1, 1, 8, 29)
+
 		feature_emb = torch.sum(cnn_feature*init_att, dim=(2, 3))
+
 		j_ctrl = self.join_ctrl(torch.cat([feature_emb, measurement_feature], 1))
 		outputs['pred_value_ctrl'] = self.value_branch_ctrl(j_ctrl)
 		outputs['pred_features_ctrl'] = j_ctrl
@@ -173,10 +219,14 @@ class TCP(nn.Module):
 		outputs['mu_branches'] = self.dist_mu(policy)
 		outputs['sigma_branches'] = self.dist_sigma(policy)
 
+		#lyuzr
+		outputs['init_att'] = att
+
 		x = j_ctrl
 		mu = outputs['mu_branches']
 		sigma = outputs['sigma_branches']
 		future_feature, future_mu, future_sigma = [], [], []
+		wp_att_list = []
 
 		# initial hidden variable to GRU
 		h = torch.zeros(size=(x.shape[0], 256), dtype=x.dtype).type_as(x)
@@ -185,6 +235,10 @@ class TCP(nn.Module):
 			x_in = torch.cat([x, mu, sigma], dim=1)
 			h = self.decoder_ctrl(x_in, h)
 			wp_att = self.wp_att(torch.cat([h, traj_hidden_state[:, _]], 1)).view(-1, 1, 8, 29)
+			# querry = torch.cat([h, traj_hidden_state[:, _]], 1)
+			# _, test_att = self.multihead_attn(querry, querry, querry)
+			# print("1111111")
+			# print(test_att.shape)
 			new_feature_emb = torch.sum(cnn_feature*wp_att, dim=(2, 3))
 			merged_feature = self.merge(torch.cat([h, new_feature_emb], 1))
 			dx = self.output_ctrl(merged_feature)
@@ -196,11 +250,15 @@ class TCP(nn.Module):
 			future_feature.append(x)
 			future_mu.append(mu)
 			future_sigma.append(sigma)
+			wp_att_list.append(wp_att)
 
 
 		outputs['future_feature'] = future_feature
 		outputs['future_mu'] = future_mu
 		outputs['future_sigma'] = future_sigma
+
+		outputs['wp_att'] = wp_att_list[2]
+
 		return outputs
 
 	def process_action(self, pred, command, speed, target_point):
